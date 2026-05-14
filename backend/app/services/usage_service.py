@@ -1,12 +1,18 @@
+import copy
+import hashlib
 import json
+import time as monotonic_time
 from collections import defaultdict
-from datetime import datetime, time, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta
 from typing import NamedTuple
 
+import httpx
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from app.core.config import load_config
 from app.core.errors import NotFoundError
 from app.models import ModelPrice, UsageRecord, User, UserApiKey
 from app.schemas.auth import AuthUserResponse
@@ -34,6 +40,18 @@ from app.services.user_service import (
 )
 
 TOKENS_PER_MILLION = 1_000_000
+REMOTE_USAGE_TIMEOUT_SECONDS = 5
+REMOTE_USAGE_CACHE_SECONDS = 15
+_remote_usage_cache: dict[str, object] = {
+    "expires_at": 0.0,
+    "cache_key": "",
+    "payload": None,
+    "records": None,
+}
+
+
+class RemoteUsageUnavailable(RuntimeError):
+    pass
 
 
 class CostResult(NamedTuple):
@@ -53,6 +71,32 @@ class UsageAccessScope(NamedTuple):
     user_id: int
     username: str
     is_admin: bool
+
+
+@dataclass(slots=True)
+class RemoteUsageRecord:
+    id: int
+    timestamp: datetime
+    usage_username: str | None
+    api_key_description: str | None
+    provider: str | None
+    model: str | None
+    endpoint: str | None
+    source: str | None
+    request_id: str | None
+    auth: str | None
+    latency_ms: float | None
+    failed: bool
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+    dedupe_key: str
+    raw_json: str
+
+
+UsageLikeRecord = UsageRecord | RemoteUsageRecord
 
 
 def default_today_range() -> tuple[datetime, datetime]:
@@ -99,10 +143,237 @@ def effective_scoped_filters(
     scoped = scoped_filters(filters, scope)
     if scoped.usage_username is not None or scoped.user_id is None:
         return scoped
-    username = session.exec(
-        select(User.username).where(User.id == scoped.user_id)
-    ).first()
+    username = session.exec(select(User.username).where(User.id == scoped.user_id)).first()
     return scoped.model_copy(update={"usage_username": username or "__missing_user__"})
+
+
+def _parse_remote_timestamp(value: object) -> datetime:
+    if isinstance(value, int | float):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        return datetime.fromtimestamp(timestamp, tz=UTC).astimezone().replace(tzinfo=None)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return datetime.now()
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    return datetime.now()
+
+
+def _stable_remote_id(record_key: str) -> int:
+    return int(hashlib.sha256(record_key.encode("utf-8")).hexdigest()[:15], 16)
+
+
+def _remote_usage_config() -> tuple[str, str, str]:
+    config = load_config()
+    base_url = config.usage_service_url.strip().rstrip("/")
+    if not base_url:
+        raise RemoteUsageUnavailable("主统计服务地址未配置")
+    management_key = config.collector.management_key.strip()
+    if not management_key:
+        raise RemoteUsageUnavailable("主统计服务管理密钥未配置")
+    return base_url, management_key, f"{base_url}|{management_key}"
+
+
+def _fetch_remote_usage_payload() -> dict[str, object]:
+    base_url, management_key, cache_key = _remote_usage_config()
+    now = monotonic_time.monotonic()
+    cached = _remote_usage_cache.get("payload")
+    if (
+        cached is not None
+        and cache_key == _remote_usage_cache.get("cache_key")
+        and now < float(_remote_usage_cache.get("expires_at") or 0)
+    ):
+        return copy.deepcopy(cached)
+
+    headers = {"Authorization": f"Bearer {management_key}"}
+    try:
+        with httpx.Client(base_url=base_url, timeout=REMOTE_USAGE_TIMEOUT_SECONDS) as client:
+            response = client.get("/v0/management/usage", headers=headers)
+            if not 200 <= response.status_code < 300:
+                raise RemoteUsageUnavailable(f"主统计服务 HTTP {response.status_code}")
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RemoteUsageUnavailable(str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise RemoteUsageUnavailable("主统计服务返回格式无效")
+    _remote_usage_cache["payload"] = payload
+    _remote_usage_cache["records"] = None
+    _remote_usage_cache["cache_key"] = cache_key
+    _remote_usage_cache["expires_at"] = monotonic_time.monotonic() + REMOTE_USAGE_CACHE_SECONDS
+    return copy.deepcopy(payload)
+
+
+def _remote_owner_lookup(session: Session) -> dict[str, dict[str, object | None]]:
+    users = {user.id: user for user in session.exec(select(User)).all()}
+    lookup: dict[str, dict[str, object | None]] = {}
+    for binding in session.exec(select(UserApiKey)).all():
+        user = users.get(binding.user_id)
+        lookup[binding.api_key_hash] = {
+            "usage_username": user.username if user else None,
+            "api_key_description": binding.description or None,
+        }
+    return lookup
+
+
+def _remote_usage_records(session: Session) -> list[RemoteUsageRecord]:
+    _, _, cache_key = _remote_usage_config()
+    now = monotonic_time.monotonic()
+    cached = _remote_usage_cache.get("records")
+    if (
+        cached is not None
+        and cache_key == _remote_usage_cache.get("cache_key")
+        and now < float(_remote_usage_cache.get("expires_at") or 0)
+    ):
+        return list(cached)
+
+    payload = _fetch_remote_usage_payload()
+    owners = _remote_owner_lookup(session)
+    apis = payload.get("apis")
+    if not isinstance(apis, dict):
+        return []
+    records: list[RemoteUsageRecord] = []
+    for endpoint, api_payload in apis.items():
+        if not isinstance(api_payload, dict):
+            continue
+        models = api_payload.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model, model_payload in models.items():
+            if not isinstance(model_payload, dict):
+                continue
+            details = model_payload.get("details")
+            if not isinstance(details, list):
+                continue
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                tokens = detail.get("tokens") if isinstance(detail.get("tokens"), dict) else {}
+                api_key_hash = str(detail.get("api_key_hash") or "")
+                owner = owners.get(
+                    api_key_hash,
+                    {
+                        "usage_username": None,
+                        "api_key_description": None,
+                    },
+                )
+                raw_payload = {"endpoint": endpoint, "model": model, **detail}
+                raw_json = json.dumps(raw_payload, ensure_ascii=False, default=str)
+                key = "|".join(
+                    [
+                        str(endpoint),
+                        str(model),
+                        str(detail.get("timestamp") or ""),
+                        api_key_hash,
+                        str(detail.get("source") or ""),
+                        str(detail.get("auth_index") or ""),
+                        json.dumps(tokens, sort_keys=True, default=str),
+                    ]
+                )
+                record_id = _stable_remote_id(key)
+                records.append(
+                    RemoteUsageRecord(
+                        id=record_id,
+                        timestamp=_parse_remote_timestamp(detail.get("timestamp")),
+                        usage_username=owner["usage_username"],
+                        api_key_description=owner["api_key_description"],
+                        provider=str(detail.get("auth_provider_snapshot") or "") or None,
+                        model=str(model or "") or None,
+                        endpoint=str(endpoint or "") or None,
+                        source=str(detail.get("source") or "") or None,
+                        request_id=None,
+                        auth=str(detail.get("auth_index") or "") or None,
+                        latency_ms=float(detail["latency_ms"])
+                        if detail.get("latency_ms") is not None
+                        else None,
+                        failed=bool(detail.get("failed")),
+                        input_tokens=int(tokens.get("input_tokens") or 0),
+                        output_tokens=int(tokens.get("output_tokens") or 0),
+                        cached_tokens=int(
+                            tokens.get("cached_tokens") or tokens.get("cache_tokens") or 0
+                        ),
+                        reasoning_tokens=int(tokens.get("reasoning_tokens") or 0),
+                        total_tokens=int(tokens.get("total_tokens") or 0),
+                        dedupe_key=hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                        raw_json=raw_json,
+                    )
+                )
+    _remote_usage_cache["records"] = records
+    return list(records)
+
+
+def _filter_records_in_memory(
+    records: list[UsageLikeRecord], filters: UsageFilterParams
+) -> list[UsageLikeRecord]:
+    effective = normalized_filters(filters)
+    selected: list[UsageLikeRecord] = []
+    for record in records:
+        if effective.start is not None and record.timestamp < effective.start:
+            continue
+        if effective.end is not None and record.timestamp >= effective.end:
+            continue
+        if (
+            effective.usage_username is not None
+            and record.usage_username != effective.usage_username
+        ):
+            continue
+        if (
+            effective.api_key_description
+            and record.api_key_description != effective.api_key_description
+        ):
+            continue
+        if effective.provider and record.provider != effective.provider:
+            continue
+        if effective.model and record.model != effective.model:
+            continue
+        if effective.endpoint and record.endpoint != effective.endpoint:
+            continue
+        if effective.failed is not None and record.failed != effective.failed:
+            continue
+        if effective.request_id and effective.request_id not in (record.request_id or ""):
+            continue
+        selected.append(record)
+    return selected
+
+
+def _remote_effective_records(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+) -> tuple[UsageAccessScope, UsageFilterParams, list[UsageLikeRecord]]:
+    scope = access_scope(current_user, filters.scope)
+    effective = normalized_filters(effective_scoped_filters(session, filters, scope))
+    records = _filter_records_in_memory(_remote_usage_records(session), effective)
+    records.sort(key=lambda record: record.timestamp)
+    return scope, effective, records
+
+
+def _remote_options_from_records(
+    session: Session,
+    current_user: AuthUserResponse,
+    requested_scope: str | None = None,
+) -> UsageOptionsResponse:
+    scope = access_scope(current_user, requested_scope)
+    filters = UsageFilterParams(scope=requested_scope)
+    effective = effective_scoped_filters(session, filters, scope)
+    records = _filter_records_in_memory(_remote_usage_records(session), effective)
+    api_key_descriptions = [record.api_key_description for record in records]
+    return UsageOptionsResponse(
+        users=_local_get_options(session, current_user, requested_scope).users
+        if scope.is_admin
+        else [],
+        api_key_descriptions=_api_key_description_options(api_key_descriptions),
+        providers=sorted({record.provider for record in records if record.provider}),
+        models=sorted({record.model for record in records if record.model}),
+        endpoints=sorted({record.endpoint for record in records if record.endpoint}),
+    )
 
 
 def save_usage_message(
@@ -462,9 +733,7 @@ def _ranking_from_records(
         )
     items.sort(key=lambda item: (item.total_tokens, item.records), reverse=True)
     safe_group = (
-        group_by
-        if group_by in {"api_key_description", "model", "user"}
-        else "api_key_description"
+        group_by if group_by in {"api_key_description", "model", "user"} else "api_key_description"
     )
     return UsageRankingsResponse(group_by=safe_group, items=items[:20])
 
@@ -506,7 +775,7 @@ def _distributions_from_records(
     )
 
 
-def get_summary(
+def _local_get_summary(
     session: Session,
     filters: UsageFilterParams,
     current_user: AuthUserResponse,
@@ -519,7 +788,20 @@ def get_summary(
     return _summary_from_records(effective, records, costs)
 
 
-def get_trends(
+def get_summary(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+) -> UsageSummaryResponse:
+    try:
+        _, effective, records = _remote_effective_records(session, filters, current_user)
+        prices = get_price_map(session)
+        return _summary_from_records(effective, records, _cost_map(records, prices))
+    except RemoteUsageUnavailable:
+        return _local_get_summary(session, filters, current_user)
+
+
+def _local_get_trends(
     session: Session,
     filters: UsageFilterParams,
     current_user: AuthUserResponse,
@@ -532,7 +814,20 @@ def get_trends(
     return _trend_points_from_records(effective, records, costs)
 
 
-def get_rankings(
+def get_trends(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+) -> list[TrendPoint]:
+    try:
+        _, effective, records = _remote_effective_records(session, filters, current_user)
+        prices = get_price_map(session)
+        return _trend_points_from_records(effective, records, _cost_map(records, prices))
+    except RemoteUsageUnavailable:
+        return _local_get_trends(session, filters, current_user)
+
+
+def _local_get_rankings(
     session: Session,
     filters: UsageFilterParams,
     current_user: AuthUserResponse,
@@ -548,7 +843,24 @@ def get_rankings(
     return _ranking_from_records(records, costs, group_by, users)
 
 
-def get_distributions(
+def get_rankings(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+    group_by: str,
+) -> UsageRankingsResponse:
+    try:
+        scope, _, records = _remote_effective_records(session, filters, current_user)
+        if not scope.is_admin and group_by == "user":
+            return UsageRankingsResponse(group_by="user", items=[])
+        users = _user_lookup_for_scope(session, scope)
+        prices = get_price_map(session)
+        return _ranking_from_records(records, _cost_map(records, prices), group_by, users)
+    except RemoteUsageUnavailable:
+        return _local_get_rankings(session, filters, current_user, group_by)
+
+
+def _local_get_distributions(
     session: Session,
     filters: UsageFilterParams,
     current_user: AuthUserResponse,
@@ -560,7 +872,20 @@ def get_distributions(
     return _distributions_from_records(records, costs)
 
 
-def get_overview(
+def get_distributions(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+) -> UsageDistributionsResponse:
+    try:
+        _, _, records = _remote_effective_records(session, filters, current_user)
+        prices = get_price_map(session)
+        return _distributions_from_records(records, _cost_map(records, prices))
+    except RemoteUsageUnavailable:
+        return _local_get_distributions(session, filters, current_user)
+
+
+def _local_get_overview(
     session: Session,
     filters: UsageFilterParams,
     current_user: AuthUserResponse,
@@ -593,7 +918,41 @@ def get_overview(
     )
 
 
-def list_records(
+def get_overview(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+) -> UsageOverviewResponse:
+    try:
+        scope, effective, records = _remote_effective_records(session, filters, current_user)
+        prices = get_price_map(session)
+        users = _user_lookup_for_scope(session, scope)
+        costs = _cost_map(records, prices)
+        api_key_description_ranking = _ranking_from_records(
+            records,
+            costs,
+            "api_key_description",
+            users,
+        )
+        return UsageOverviewResponse(
+            summary=_summary_from_records(effective, records, costs),
+            trends=_trend_points_from_records(effective, records, costs),
+            user_ranking=(
+                _ranking_from_records(records, costs, "user", users)
+                if scope.is_admin
+                else UsageRankingsResponse(group_by="user", items=[])
+            ),
+            api_key_description_ranking=api_key_description_ranking,
+            api_key_ranking=api_key_description_ranking,
+            model_ranking=_ranking_from_records(records, costs, "model", users),
+            distributions=_distributions_from_records(records, costs),
+            options=_remote_options_from_records(session, current_user, filters.scope),
+        )
+    except RemoteUsageUnavailable:
+        return _local_get_overview(session, filters, current_user)
+
+
+def _local_list_records(
     session: Session,
     filters: UsageFilterParams,
     current_user: AuthUserResponse,
@@ -631,23 +990,67 @@ def list_records(
     )
 
 
+def list_records(
+    session: Session,
+    filters: UsageFilterParams,
+    current_user: AuthUserResponse,
+    page: int,
+    page_size: int,
+) -> UsageRecordsResponse:
+    try:
+        scope, effective_filters, records = _remote_effective_records(
+            session, filters, current_user
+        )
+        effective_page = max(page, 1)
+        effective_size = min(max(page_size, 1), 200)
+        total = len(records)
+        page_records = sorted(records, key=lambda record: record.timestamp, reverse=True)[
+            (effective_page - 1) * effective_size : effective_page * effective_size
+        ]
+        users = _user_lookup_for_scope(session, scope)
+        prices = get_price_map(session)
+        return UsageRecordsResponse(
+            items=[_to_list_item(record, users, prices) for record in page_records],
+            total=total,
+            page=effective_page,
+            page_size=effective_size,
+            start=effective_filters.start or default_today_range()[0],
+            end=effective_filters.end or default_today_range()[1],
+        )
+    except RemoteUsageUnavailable:
+        return _local_list_records(session, filters, current_user, page, page_size)
+
+
 def get_record_detail(
     session: Session,
     record_id: int,
     current_user: AuthUserResponse,
     requested_scope: str | None = None,
 ) -> UsageRecordDetailResponse:
-    scope = access_scope(current_user, requested_scope)
-    record = session.get(UsageRecord, record_id)
-    if record is None or not _record_is_visible_to_scope(record, scope):
-        raise NotFoundError("usage 记录不存在")
-    users = _user_lookup_for_scope(session, scope)
-    prices = get_price_map(session)
-    item = _to_list_item(record, users, prices)
-    return UsageRecordDetailResponse(
-        **item.model_dump(),
-        raw_json=redacted_raw_json(record.raw_json),
-    )
+    try:
+        scope = access_scope(current_user, requested_scope)
+        records = _remote_usage_records(session)
+        record = next((item for item in records if item.id == record_id), None)
+        if record is None or not _record_is_visible_to_scope(record, scope):
+            raise NotFoundError("usage 记录不存在")
+        users = _user_lookup_for_scope(session, scope)
+        prices = get_price_map(session)
+        item = _to_list_item(record, users, prices)
+        return UsageRecordDetailResponse(
+            **item.model_dump(), raw_json=redacted_raw_json(record.raw_json)
+        )
+    except RemoteUsageUnavailable:
+        scope = access_scope(current_user, requested_scope)
+        record = session.get(UsageRecord, record_id)
+        if record is None or not _record_is_visible_to_scope(record, scope):
+            raise NotFoundError("usage 记录不存在") from None
+        users = _user_lookup_for_scope(session, scope)
+        prices = get_price_map(session)
+        item = _to_list_item(record, users, prices)
+        return UsageRecordDetailResponse(
+            **item.model_dump(),
+            raw_json=redacted_raw_json(record.raw_json),
+        )
 
 
 def _api_key_description_options(descriptions: list[str | None]) -> list[RankingItem]:
@@ -667,7 +1070,7 @@ def _api_key_description_options(descriptions: list[str | None]) -> list[Ranking
     ]
 
 
-def get_options(
+def _local_get_options(
     session: Session,
     current_user: AuthUserResponse,
     requested_scope: str | None = None,
@@ -741,3 +1144,14 @@ def get_options(
         models=sorted(model for model in models if model),
         endpoints=sorted(endpoint for endpoint in endpoints if endpoint),
     )
+
+
+def get_options(
+    session: Session,
+    current_user: AuthUserResponse,
+    requested_scope: str | None = None,
+) -> UsageOptionsResponse:
+    try:
+        return _remote_options_from_records(session, current_user, requested_scope)
+    except RemoteUsageUnavailable:
+        return _local_get_options(session, current_user, requested_scope)

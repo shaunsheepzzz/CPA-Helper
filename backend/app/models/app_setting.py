@@ -10,6 +10,7 @@ class AppSetting(SQLModel, table=True):
     id: int = Field(default=1, primary_key=True)
     collector_enabled: bool = Field(default=False)
     cliaproxy_url: str = Field(default="http://127.0.0.1:8317", max_length=500)
+    usage_service_url: str = Field(default="http://127.0.0.1:18318", max_length=500)
     management_key: str = Field(default="", max_length=1000)
     queue_name: str = Field(default="usage", max_length=120)
     batch_size: int = Field(default=100)

@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
 
@@ -394,6 +395,143 @@ def test_settings_are_stored_in_sqlite_without_json_config(
         assert setting.collector_enabled is True
         assert setting.queue_name == "usage"
 
+
+def test_local_collector_is_blocked_when_usage_service_is_available(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    _login_and_change_default_password(client)
+
+    monkeypatch.setattr(
+        "app.services.settings_service.check_usage_service",
+        lambda url, management_key="": (True, None),
+    )
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "usage_service_url": "http://127.0.0.1:18318",
+            "management_key": "management-secret",
+            "collector_enabled": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "主统计服务可用" in response.json()["detail"]["message"]
+
+
+def test_local_collector_can_be_enabled_when_usage_service_is_unavailable(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    _login_and_change_default_password(client)
+
+    monkeypatch.setattr(
+        "app.services.settings_service.check_usage_service",
+        lambda url, management_key="": (False, "connection refused"),
+    )
+
+    response = client.put(
+        "/api/settings",
+        json={
+            "usage_service_url": "http://127.0.0.1:18318",
+            "management_key": "management-secret",
+            "collector_enabled": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["collector_enabled"] is True
+    assert response.json()["usage_service_available"] is False
+
+
+
+def test_usage_pages_prefer_primary_usage_service(client: TestClient, monkeypatch) -> None:
+    _login_and_change_default_password(client)
+    key = "sk-remote-new-key"
+    bound = client.post(
+        "/api/users/1/api-keys",
+        json={"api_key": key, "description": "RemoteNewKey"},
+    )
+    assert bound.status_code == 200
+    api_key_hash = hash_api_key(key)
+
+    saved = client.put(
+        "/api/settings",
+        json={
+            "usage_service_url": "http://usage.test",
+            "management_key": "management-secret",
+            "collector_enabled": False,
+        },
+    )
+    assert saved.status_code == 200
+
+    now = datetime.now().replace(microsecond=0)
+    payload = {
+        "total_requests": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "total_tokens": 42,
+        "apis": {
+            "POST /v1/chat/completions": {
+                "models": {
+                    "gpt-5-mini": {
+                        "details": [
+                            {
+                                "timestamp": now.isoformat(),
+                                "source": "sk-remote...",
+                                "api_key_hash": api_key_hash,
+                                "auth_index": "alias1",
+                                "auth_provider_snapshot": "openai",
+                                "latency_ms": 123,
+                                "failed": False,
+                                "tokens": {
+                                    "input_tokens": 10,
+                                    "output_tokens": 20,
+                                    "reasoning_tokens": 2,
+                                    "cached_tokens": 10,
+                                    "total_tokens": 42,
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v0/management/usage"
+        assert request.headers.get("authorization") == "Bearer management-secret"
+        return httpx.Response(200, json=payload)
+
+    original_httpx_client = httpx.Client
+    monkeypatch.setattr(
+        "app.services.usage_service.httpx.Client",
+        lambda **kwargs: original_httpx_client(
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        ),
+    )
+
+    params = {
+        "scope": "admin",
+        "start": (now - timedelta(minutes=1)).isoformat(),
+        "end": (now + timedelta(minutes=1)).isoformat(),
+    }
+    overview = client.get("/api/usage/overview", params=params)
+    assert overview.status_code == 200
+    body = overview.json()
+    assert body["summary"]["total_records"] == 1
+    assert body["summary"]["total_tokens"] == 42
+    assert body["api_key_description_ranking"]["items"][0]["label"] == "RemoteNewKey"
+
+    records = client.get("/api/usage/records", params=params)
+    assert records.status_code == 200
+    records_body = records.json()
+    assert records_body["total"] == 1
+    assert records_body["items"][0]["api_key_description"] == "RemoteNewKey"
+    assert records_body["items"][0]["model"] == "gpt-5-mini"
 
 def test_legacy_json_config_is_migrated_to_sqlite(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CPA_HELPER_DATA_DIR", str(tmp_path))

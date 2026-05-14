@@ -31,6 +31,7 @@ const collectorStatus = ref<CollectorStatus | null>(null)
 
 const settingsForm = reactive({
   cliaproxy_url: 'http://127.0.0.1:8317',
+  usage_service_url: 'http://127.0.0.1:18318',
   management_key: '',
   collector_enabled: false,
   batch_size: 100,
@@ -60,6 +61,16 @@ const remoteStatusText = computed(() => {
 
 const collectorEnabledText = computed(() => (collectorStatus.value?.enabled ? '开启' : '关闭'))
 const collectorRunningText = computed(() => (collectorStatus.value?.running ? '运行中' : '空闲'))
+const settingsFormUsageAvailable = ref(false)
+const usageServiceError = ref<string | null>(null)
+const usageServiceStatusText = computed(() => {
+  if (isLoading.value) {
+    return '检测中'
+  }
+  return settingsFormUsageAvailable.value ? '可用' : '不可用'
+})
+const usageServiceStatusType = computed(() => (settingsFormUsageAvailable.value ? 'success' : 'warning'))
+const localCollectorDisabled = computed(() => settingsFormUsageAvailable.value)
 
 async function refresh() {
   isLoading.value = true
@@ -69,11 +80,14 @@ async function refresh() {
       getCollectorStatus(),
     ])
     settingsForm.cliaproxy_url = settings.cliaproxy_url
+    settingsForm.usage_service_url = settings.usage_service_url
     settingsForm.management_key = settings.management_key
     settingsForm.collector_enabled = settings.collector_enabled
     settingsForm.batch_size = settings.batch_size
     settingsForm.poll_interval_seconds = settings.poll_interval_seconds
     settingsForm.retry_interval_seconds = settings.retry_interval_seconds
+    settingsFormUsageAvailable.value = settings.usage_service_available
+    usageServiceError.value = settings.usage_service_error
     collectorStatus.value = status
   } catch (error) {
     message.error(error instanceof Error ? error.message : '加载设置失败')
@@ -87,6 +101,7 @@ async function saveSettings() {
   try {
     const payload: SettingsUpdatePayload = {
       cliaproxy_url: settingsForm.cliaproxy_url,
+      usage_service_url: settingsForm.usage_service_url,
       management_key: settingsForm.management_key,
       collector_enabled: settingsForm.collector_enabled,
       batch_size: settingsForm.batch_size,
@@ -125,9 +140,9 @@ onMounted(refresh)
         <div class="metric-icon" aria-hidden="true">
           <Power :size="20" :stroke-width="2.2" />
         </div>
-        <div class="metric-label">本地采集</div>
+        <div class="metric-label">应急采集</div>
         <div class="metric-value">{{ collectorEnabledText }}</div>
-        <div class="metric-footnote">系统开关</div>
+        <div class="metric-footnote">本地 fallback</div>
       </div>
       <div class="metric-card" :class="collectorStatus?.running ? 'is-teal' : 'is-blue'">
         <div class="metric-icon" aria-hidden="true">
@@ -145,6 +160,14 @@ onMounted(refresh)
         <div class="metric-value">{{ remoteStatusText }}</div>
         <div class="metric-footnote">CLIProxyAPI</div>
       </div>
+      <div class="metric-card" :class="settingsFormUsageAvailable ? 'is-green' : 'is-orange'">
+        <div class="metric-icon" aria-hidden="true">
+          <Server :size="20" :stroke-width="2.2" />
+        </div>
+        <div class="metric-label">主统计服务</div>
+        <div class="metric-value">{{ usageServiceStatusText }}</div>
+        <div class="metric-footnote">CPA-Manager</div>
+      </div>
       <div class="metric-card is-blue">
         <div class="metric-icon" aria-hidden="true">
           <Database :size="20" :stroke-width="2.2" />
@@ -159,10 +182,30 @@ onMounted(refresh)
       <section class="panel">
         <div class="panel-inner">
           <h2 class="section-title">采集配置</h2>
+          <NAlert
+            v-if="settingsFormUsageAvailable"
+            type="success"
+            :bordered="false"
+            class="status-alert"
+          >
+            主统计服务可用，当前页面会阻止开启本地应急采集，避免重复消费 CPA usage 队列。
+          </NAlert>
+          <NAlert
+            v-else
+            type="warning"
+            :bordered="false"
+            class="status-alert"
+          >
+            主统计服务不可用。需要临时接管统计时，可人工开启本地应急采集。
+            <span v-if="usageServiceError">原因：{{ usageServiceError }}</span>
+          </NAlert>
           <NForm :model="settingsForm" label-placement="top">
             <div class="form-grid">
               <NFormItem label="CLIProxyAPI / CPAMC 地址">
                 <NInput v-model:value="settingsForm.cliaproxy_url" />
+              </NFormItem>
+              <NFormItem label="主统计服务地址（CPA-Manager / 18318）">
+                <NInput v-model:value="settingsForm.usage_service_url" />
               </NFormItem>
               <NFormItem label="管理密钥">
                 <NInput
@@ -172,8 +215,16 @@ onMounted(refresh)
                   placeholder="请输入 CLIProxyAPI 管理密钥"
                 />
               </NFormItem>
-              <NFormItem label="开启本地采集">
-                <NSwitch v-model:value="settingsForm.collector_enabled" />
+              <NFormItem label="开启本地应急采集">
+                <NSpace vertical size="small">
+                  <NSwitch
+                    v-model:value="settingsForm.collector_enabled"
+                    :disabled="localCollectorDisabled"
+                  />
+                  <span class="form-hint">
+                    主统计服务可用时保持关闭；只有 18318 不可用并需要临时接管时再手动开启。
+                  </span>
+                </NSpace>
               </NFormItem>
               <NFormItem label="批量读取数">
                 <NInputNumber v-model:value="settingsForm.batch_size" :min="1" :max="1000" />
@@ -203,6 +254,14 @@ onMounted(refresh)
                 {{ collectorStatus?.running ? '运行中' : '空闲' }}
               </NTag>
             </NDescriptionsItem>
+            <NDescriptionsItem label="主统计服务">
+              <NTag :type="usageServiceStatusType" size="small">
+                {{ usageServiceStatusText }}
+              </NTag>
+            </NDescriptionsItem>
+            <NDescriptionsItem label="主服务地址">
+              {{ settingsForm.usage_service_url }}
+            </NDescriptionsItem>
             <NDescriptionsItem label="远端开关">
               <NTag :type="remoteStatusType" size="small">
                 {{ remoteStatusText }}
@@ -225,6 +284,14 @@ onMounted(refresh)
             class="status-alert"
           >
             {{ collectorStatus.last_error }}
+          </NAlert>
+          <NAlert
+            v-if="usageServiceError"
+            type="warning"
+            :bordered="false"
+            class="status-alert"
+          >
+            {{ usageServiceError }}
           </NAlert>
         </div>
       </section>
@@ -249,6 +316,12 @@ onMounted(refresh)
 
 .status-alert {
   margin-top: 10px;
+}
+
+.form-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 @media (max-width: 900px) {

@@ -29,6 +29,9 @@ export interface FirstAdminSetupPayload {
 
 export interface SettingsResponse {
   cliaproxy_url: string
+  usage_service_url: string
+  usage_service_available: boolean
+  usage_service_error: string | null
   management_key: string
   management_key_set: boolean
   collector_enabled: boolean
@@ -40,6 +43,7 @@ export interface SettingsResponse {
 
 export interface SettingsUpdatePayload {
   cliaproxy_url?: string
+  usage_service_url?: string
   management_key?: string
   collector_enabled?: boolean
   queue_name?: string

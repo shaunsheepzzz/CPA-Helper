@@ -48,6 +48,7 @@ DEFAULT_CODEX_KEEPER_PRIORITY_RULES: dict[str, int] = {
 
 class AppConfig(BaseModel):
     collector: CollectorConfig = Field(default_factory=CollectorConfig)
+    usage_service_url: str = "http://127.0.0.1:18318"
     codex_keeper: CodexKeeperConfig = Field(default_factory=CodexKeeperConfig)
     codex_keeper_priority_rules: dict[str, int] = Field(
         default_factory=lambda: dict(DEFAULT_CODEX_KEEPER_PRIORITY_RULES)
@@ -71,6 +72,7 @@ def _read_legacy_config() -> AppConfig | None:
     return AppConfig.model_validate(
         {
             "collector": raw.get("collector", {}),
+            "usage_service_url": raw.get("usage_service_url") or "http://127.0.0.1:18318",
             "codex_keeper": _normalize_keeper_payload(raw.get("codex_keeper", {})),
             "codex_keeper_priority_rules": raw.get(
                 "codex_keeper_priority_rules",
@@ -120,6 +122,7 @@ def _setting_to_config(setting: AppSetting) -> AppConfig:
             poll_interval_seconds=setting.poll_interval_seconds,
             retry_interval_seconds=setting.retry_interval_seconds,
         ),
+        usage_service_url=setting.usage_service_url,
         codex_keeper=CodexKeeperConfig.model_validate(keeper_payload),
         codex_keeper_priority_rules=priority_rules,
         session_secret=setting.session_secret,
@@ -131,6 +134,7 @@ def _setting_from_config(config: AppConfig, setting: AppSetting | None = None) -
     target.id = 1
     target.collector_enabled = config.collector.enabled
     target.cliaproxy_url = config.collector.cliaproxy_url
+    target.usage_service_url = config.usage_service_url.strip().rstrip("/")
     target.management_key = config.collector.management_key
     target.queue_name = config.collector.queue_name
     target.batch_size = config.collector.batch_size
