@@ -45,7 +45,7 @@ def find_matching_price(
     model: str | None,
 ) -> ModelPrice | None:
     provider_key, model_key = _price_key(provider, model)
-    if not provider_key or not model_key:
+    if not model_key:
         return None
 
     for candidate_provider in _candidate_provider_keys(provider_key):
@@ -284,4 +284,6 @@ def _normalize_price_part(value: str | None) -> str:
 
 
 def _candidate_provider_keys(provider_key: str) -> tuple[str, ...]:
+    if not provider_key:
+        return ("unknown",)
     return (provider_key, *QUERY_PROVIDER_ALIASES.get(provider_key, ()))

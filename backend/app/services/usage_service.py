@@ -46,7 +46,6 @@ _remote_usage_cache: dict[str, object] = {
     "expires_at": 0.0,
     "cache_key": "",
     "payload": None,
-    "records": None,
 }
 
 
@@ -79,6 +78,7 @@ class RemoteUsageRecord:
     timestamp: datetime
     usage_username: str | None
     api_key_description: str | None
+    api_key_hash: str
     provider: str | None
     model: str | None
     endpoint: str | None
@@ -205,7 +205,6 @@ def _fetch_remote_usage_payload() -> dict[str, object]:
     if not isinstance(payload, dict):
         raise RemoteUsageUnavailable("主统计服务返回格式无效")
     _remote_usage_cache["payload"] = payload
-    _remote_usage_cache["records"] = None
     _remote_usage_cache["cache_key"] = cache_key
     _remote_usage_cache["expires_at"] = monotonic_time.monotonic() + REMOTE_USAGE_CACHE_SECONDS
     return copy.deepcopy(payload)
@@ -224,16 +223,6 @@ def _remote_owner_lookup(session: Session) -> dict[str, dict[str, object | None]
 
 
 def _remote_usage_records(session: Session) -> list[RemoteUsageRecord]:
-    _, _, cache_key = _remote_usage_config()
-    now = monotonic_time.monotonic()
-    cached = _remote_usage_cache.get("records")
-    if (
-        cached is not None
-        and cache_key == _remote_usage_cache.get("cache_key")
-        and now < float(_remote_usage_cache.get("expires_at") or 0)
-    ):
-        return list(cached)
-
     payload = _fetch_remote_usage_payload()
     owners = _remote_owner_lookup(session)
     apis = payload.get("apis")
@@ -284,6 +273,7 @@ def _remote_usage_records(session: Session) -> list[RemoteUsageRecord]:
                         timestamp=_parse_remote_timestamp(detail.get("timestamp")),
                         usage_username=owner["usage_username"],
                         api_key_description=owner["api_key_description"],
+                        api_key_hash=api_key_hash,
                         provider=str(detail.get("auth_provider_snapshot") or "") or None,
                         model=str(model or "") or None,
                         endpoint=str(endpoint or "") or None,
@@ -305,8 +295,7 @@ def _remote_usage_records(session: Session) -> list[RemoteUsageRecord]:
                         raw_json=raw_json,
                     )
                 )
-    _remote_usage_cache["records"] = records
-    return list(records)
+    return records
 
 
 def _filter_records_in_memory(

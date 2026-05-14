@@ -203,9 +203,7 @@ def create_generated_api_key(
     payload: ApiKeyCreateRequest,
 ) -> UserApiKeySummary:
     ensure_users_initialized(session)
-    user = session.exec(
-        select(User).where(User.disabled_at.is_(None)).order_by(User.id)
-    ).first()
+    user = session.exec(select(User).where(User.disabled_at.is_(None)).order_by(User.id)).first()
     if user is None:
         raise ConflictError("请先创建首个管理员账号")
     return _create_generated_api_key_for_user(session, user, payload.description)
@@ -342,9 +340,7 @@ def _to_user_info(user: User) -> UserInfo:
 def get_user_api_key_hashes(session: Session, user_id: int) -> list[str]:
     ensure_users_initialized(session)
     return list(
-        session.exec(
-            select(UserApiKey.api_key_hash).where(UserApiKey.user_id == user_id)
-        ).all()
+        session.exec(select(UserApiKey.api_key_hash).where(UserApiKey.user_id == user_id)).all()
     )
 
 
@@ -433,9 +429,7 @@ def _find_user_by_username(session: Session, username: str) -> User | None:
 
 
 def _first_user_id(session: Session) -> int | None:
-    return session.exec(
-        select(User.id).where(User.disabled_at.is_(None)).order_by(User.id)
-    ).first()
+    return session.exec(select(User.id).where(User.disabled_at.is_(None)).order_by(User.id)).first()
 
 
 def _ensure_username_available(
@@ -523,14 +517,8 @@ def _current_user_api_key_summary(
 
 
 def _key_summaries(session: Session) -> list[UserApiKeySummary]:
-    bindings = {
-        binding.api_key_hash: binding
-        for binding in session.exec(select(UserApiKey)).all()
-    }
-    users = {
-        user.id: user
-        for user in session.exec(select(User)).all()
-    }
+    bindings = {binding.api_key_hash: binding for binding in session.exec(select(UserApiKey)).all()}
+    users = {user.id: user for user in session.exec(select(User)).all()}
     summaries = [
         _empty_key_summary(
             api_key_hash,
@@ -559,23 +547,53 @@ def _key_summaries(session: Session) -> list[UserApiKeySummary]:
 
 
 def _user_usage_summaries(session: Session) -> dict[int, dict]:
-    prices = get_price_map(session)
-    today_start, today_end = _today_range()
-    summaries: dict[int, dict] = {}
-    users_by_username = {
-        user.username: user
-        for user in session.exec(select(User)).all()
+    from app.services.usage_service import RemoteUsageUnavailable
+
+    try:
+        return _remote_user_usage_summaries(session)
+    except RemoteUsageUnavailable:
+        return _local_user_usage_summaries(session)
+
+
+def _remote_user_usage_summaries(session: Session) -> dict[int, dict]:
+    from app.services.usage_service import _remote_usage_records
+
+    user_ids_by_api_key_hash = {
+        binding.api_key_hash: binding.user_id for binding in session.exec(select(UserApiKey)).all()
     }
+    return _summaries_from_records(
+        _remote_usage_records(session),
+        lambda record: user_ids_by_api_key_hash.get(record.api_key_hash),
+        get_price_map(session),
+    )
+
+
+def _local_user_usage_summaries(session: Session) -> dict[int, dict]:
+    users_by_username = {user.username: user for user in session.exec(select(User)).all()}
     records = session.exec(
         select(UsageRecord)
         .where(UsageRecord.usage_username.is_not(None))
         .order_by(UsageRecord.timestamp.desc())
     ).all()
-    for record in records:
+
+    def user_id_for_record(record):
         user = users_by_username.get(record.usage_username or "")
-        if user is None or user.id is None:
+        return user.id if user is not None else None
+
+    return _summaries_from_records(records, user_id_for_record, get_price_map(session))
+
+
+def _summaries_from_records(
+    records,
+    user_id_for_record,
+    prices: dict[tuple[str, str], ModelPrice],
+) -> dict[int, dict]:
+    today_start, today_end = _today_range()
+    summaries: dict[int, dict] = {}
+    for record in records:
+        user_id = user_id_for_record(record)
+        if user_id is None:
             continue
-        user_id = user.id
         existing = summaries.setdefault(user_id, _empty_user_usage_summary())
         existing["records"] += 1
         existing["failed_records"] += int(record.failed)

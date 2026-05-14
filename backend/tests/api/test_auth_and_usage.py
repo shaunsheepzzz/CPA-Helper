@@ -10,7 +10,7 @@ from app.db.session import get_engine, reset_engine_for_tests
 from app.main import app
 from app.models import AppSetting, UsageRecord, User, UserApiKey
 from app.schemas.pricing import ModelPriceCreate
-from app.services import cpa_management_service
+from app.services import cpa_management_service, usage_service
 from app.services.pricing_service import create_price
 from app.services.usage_service import save_usage_message
 
@@ -445,8 +445,8 @@ def test_local_collector_can_be_enabled_when_usage_service_is_unavailable(
     assert response.json()["usage_service_available"] is False
 
 
-
 def test_usage_pages_prefer_primary_usage_service(client: TestClient, monkeypatch) -> None:
+    usage_service._remote_usage_cache.update({"expires_at": 0.0, "cache_key": "", "payload": None})
     _login_and_change_default_password(client)
     key = "sk-remote-new-key"
     bound = client.post(
@@ -532,6 +532,102 @@ def test_usage_pages_prefer_primary_usage_service(client: TestClient, monkeypatc
     assert records_body["total"] == 1
     assert records_body["items"][0]["api_key_description"] == "RemoteNewKey"
     assert records_body["items"][0]["model"] == "gpt-5-mini"
+
+
+def test_user_management_uses_primary_usage_service_api_key_hash(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    usage_service._remote_usage_cache.update({"expires_at": 0.0, "cache_key": "", "payload": None})
+    _login_and_change_default_password(client)
+    key = "sk-user-management-remote-key"
+    bound = client.post(
+        "/api/users/1/api-keys",
+        json={"api_key": key, "description": "RemoteUserKey"},
+    )
+    assert bound.status_code == 200
+    api_key_hash = hash_api_key(key)
+
+    saved = client.put(
+        "/api/settings",
+        json={
+            "usage_service_url": "http://usage.test",
+            "management_key": "management-secret",
+            "collector_enabled": False,
+        },
+    )
+    assert saved.status_code == 200
+
+    now = datetime.now().replace(microsecond=0)
+    payload = {
+        "total_requests": 1,
+        "success_count": 1,
+        "failure_count": 0,
+        "total_tokens": 1_500_000,
+        "apis": {
+            "POST /v1/responses": {
+                "models": {
+                    "gpt-5.5": {
+                        "details": [
+                            {
+                                "timestamp": now.isoformat(),
+                                "source": "sk-remote...",
+                                "api_key_hash": api_key_hash,
+                                "auth_index": "alias1",
+                                "latency_ms": 123,
+                                "failed": False,
+                                "tokens": {
+                                    "input_tokens": 1_000_000,
+                                    "output_tokens": 500_000,
+                                    "reasoning_tokens": 0,
+                                    "cached_tokens": 0,
+                                    "total_tokens": 1_500_000,
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v0/management/usage"
+        assert request.headers.get("authorization") == "Bearer management-secret"
+        return httpx.Response(200, json=payload)
+
+    original_httpx_client = httpx.Client
+    monkeypatch.setattr(
+        "app.services.usage_service.httpx.Client",
+        lambda **kwargs: original_httpx_client(
+            transport=httpx.MockTransport(handler),
+            **kwargs,
+        ),
+    )
+
+    with Session(get_engine()) as session:
+        create_price(
+            session,
+            ModelPriceCreate(
+                provider="unknown",
+                model="gpt-5.5",
+                input_usd_per_million=2,
+                output_usd_per_million=4,
+                cached_usd_per_million=0,
+                reasoning_usd_per_million=0,
+            ),
+        )
+
+    users = client.get("/api/users")
+    assert users.status_code == 200
+    admin = next(item for item in users.json() if item["username"] == "admin")
+    assert admin["today_records"] == 1
+    assert admin["today_input_tokens"] == 1_000_000
+    assert admin["today_output_tokens"] == 500_000
+    assert admin["today_total_tokens"] == 1_500_000
+    assert admin["today_estimated_cost_usd"] == 4
+    assert admin["last_model"] == "gpt-5.5"
+
 
 def test_legacy_json_config_is_migrated_to_sqlite(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CPA_HELPER_DATA_DIR", str(tmp_path))

@@ -61,6 +61,75 @@ def test_price_map_uses_exact_keys_and_query_side_provider_aliases(
     assert find_matching_price(prices, "TokenRouter", "anthropic/claude-sonnet") is None
 
 
+def test_price_matching_uses_unknown_price_for_missing_provider(
+    client: TestClient,
+) -> None:
+    _login_and_change_default_password(client)
+    with Session(get_engine()) as session:
+        create_price(
+            session,
+            ModelPriceCreate(
+                provider="unknown",
+                model="gpt-5.5",
+                input_usd_per_million=5,
+                output_usd_per_million=30,
+                cached_usd_per_million=0.5,
+                reasoning_usd_per_million=0,
+            ),
+        )
+        create_price(
+            session,
+            ModelPriceCreate(
+                provider="openai",
+                model="gpt-5.5",
+                input_usd_per_million=99,
+                output_usd_per_million=99,
+                cached_usd_per_million=99,
+                reasoning_usd_per_million=0,
+            ),
+        )
+
+        prices = get_price_map(session)
+
+    price = find_matching_price(prices, None, "gpt-5.5")
+    assert price is not None
+    assert price.provider == "unknown"
+    assert price.input_usd_per_million == 5
+
+
+def test_price_matching_does_not_use_other_provider_when_missing_provider(
+    client: TestClient,
+) -> None:
+    _login_and_change_default_password(client)
+    with Session(get_engine()) as session:
+        create_price(
+            session,
+            ModelPriceCreate(
+                provider="openai",
+                model="gpt-5.5",
+                input_usd_per_million=1,
+                output_usd_per_million=2,
+                cached_usd_per_million=0,
+                reasoning_usd_per_million=0,
+            ),
+        )
+        create_price(
+            session,
+            ModelPriceCreate(
+                provider="azure",
+                model="gpt-5.5",
+                input_usd_per_million=3,
+                output_usd_per_million=4,
+                cached_usd_per_million=0,
+                reasoning_usd_per_million=0,
+            ),
+        )
+
+        prices = get_price_map(session)
+
+    assert find_matching_price(prices, None, "gpt-5.5") is None
+
+
 def test_price_matching_does_not_apply_reverse_model_only_or_alias_fallbacks(
     client: TestClient,
 ) -> None:
